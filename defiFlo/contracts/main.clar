@@ -1,4 +1,4 @@
-;; Decentralized Liquidity Mining Protocol 
+;; Decentralized Liquidity Mining Protocol
 
 (define-constant protocol-manager tx-sender)
 (define-constant err-manager-only (err u100))
@@ -9,6 +9,7 @@
 (define-constant err-deposit-expired (err u105))
 (define-constant err-insufficient-liquidity (err u106))
 (define-constant err-invalid-parameter (err u107))
+(define-constant err-invalid-reward-rate (err u109))
 
 ;; Data Variables
 (define-data-var protocol-locked bool false)
@@ -33,6 +34,13 @@
      processed: bool,
      rewards-claimed: uint})
 
+(define-map user-analytics
+    principal
+    {total-deposits: uint,
+     active-deposits: uint,
+     total-rewards: uint,
+     last-active: uint})
+
 (define-data-var registry-counter uint u0)
 (define-data-var lock-period uint u144) ;; Default 24 hours (144 blocks)
 (define-data-var max-min-deposit uint u1000000) 
@@ -50,6 +58,11 @@
 
 (define-read-only (get-deposit-details (deposit-id uint))
     (map-get? deposit-registry deposit-id))
+
+(define-read-only (get-user-stats (user principal))
+    (default-to 
+        {total-deposits: u0, active-deposits: u0, total-rewards: u0, last-active: u0}
+        (map-get? user-analytics user)))
 
 (define-read-only (get-protocol-metrics)
     {total-deposits: (var-get registry-counter),
@@ -89,6 +102,23 @@
                    total-deposits: (+ (get total-deposits current-metrics) deposit-amount),
                    last-update-time: block-height}))))
 
+(define-private (update-user-analytics (user principal) (amount uint) (is-deposit bool))
+    (let ((current-stats (get-user-stats user)))
+        (map-set user-analytics
+            user
+            (merge current-stats
+                  {total-deposits: (+ (get total-deposits current-stats) (if is-deposit amount u0)),
+                   active-deposits: (+ (get active-deposits current-stats) (if is-deposit amount (- u0 amount))),
+                   last-active: block-height}))))
+
+(define-private (update-user-rewards (user principal) (rewards uint))
+    (let ((current-stats (get-user-stats user)))
+        (map-set user-analytics
+            user
+            (merge current-stats
+                  {total-rewards: (+ (get total-rewards current-stats) rewards),
+                   last-active: block-height}))))
+
 (define-private (validate-principal (principal-to-check principal))
     (is-some (get-pool-profile principal-to-check)))
 
@@ -107,7 +137,7 @@
         (asserts! (is-eq protocol-manager tx-sender) err-manager-only)
         (asserts! (not (validate-principal new-pool)) err-invalid-parameter)
         (asserts! (validate-min-deposit minimum-deposit) err-invalid-parameter)
-        (asserts! (validate-reward-rate reward-rate) err-invalid-parameter)
+        (asserts! (validate-reward-rate reward-rate) err-invalid-reward-rate)
         (ok (map-set liquidity-pools
             new-pool
             {performance: u0,
@@ -139,7 +169,7 @@
         (asserts! (is-eq protocol-manager tx-sender) err-manager-only)
         (asserts! (validate-principal target-pool) err-invalid-parameter)
         (asserts! (validate-min-deposit minimum-deposit) err-invalid-parameter)
-        (asserts! (validate-reward-rate reward-rate) err-invalid-parameter)
+        (asserts! (validate-reward-rate reward-rate) err-invalid-reward-rate)
         (let ((pool-data (unwrap-panic (get-pool-profile target-pool))))
             (ok (map-set liquidity-pools
                 target-pool
@@ -173,6 +203,9 @@
              processed: false,
              rewards-claimed: u0})
         
+        ;; Update user analytics
+        (update-user-analytics provider amount true)
+        
         ;; Increment registry counter
         (var-set registry-counter (+ (var-get registry-counter) u1))
         (ok true)))
@@ -198,6 +231,24 @@
         (update-pool-metrics pool (get amount deposit))
         (ok true)))
 
+(define-public (cancel-deposit (registry-id uint))
+    (let ((deposit (unwrap-panic (map-get? deposit-registry registry-id)))
+          (provider tx-sender))
+        (asserts! (is-eq provider (get provider deposit)) err-manager-only)
+        (asserts! (not (get processed deposit)) err-invalid-nonce)
+        
+        ;; Cancel the deposit
+        (map-set deposit-registry
+            registry-id
+            (merge deposit {processed: true}))
+        
+        ;; Update user analytics
+        (update-user-analytics provider (get amount deposit) false)
+        
+        ;; Update nonce
+        (increment-nonce provider)
+        (ok true)))
+
 (define-public (claim-rewards (deposit-id uint))
     (let ((deposit (unwrap-panic (map-get? deposit-registry deposit-id)))
           (provider tx-sender)
@@ -209,5 +260,8 @@
         (map-set deposit-registry
             deposit-id
             (merge deposit {rewards-claimed: (+ (get rewards-claimed deposit) rewards)}))
+        
+        ;; Update user analytics
+        (update-user-rewards provider rewards)
         
         (ok rewards)))
